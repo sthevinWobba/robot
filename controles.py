@@ -8,7 +8,8 @@ import sys
 # =======================================================================
 
 # --- Configuración de Red UDP ---
-ESP32_IP = "192.168.1.100"  # ¡Cámbiala a la IP real de tu ESP32!
+ESP32_IP = "192.168.0.11"  # IP estática del ESP32
+
 ESP32_PORT = 2390           # Debe coincidir con el puerto en el código del ESP32
 
 # --- Configuración del Joystick Logitech F310 ---
@@ -16,17 +17,22 @@ JOYSTICK_DEADZONE = 0.1     # Ignorar movimientos pequeños cerca del centro
 MAX_JOY_VALUE = 100         # Rango máximo de valores enviados al ESP32 (±100)
 UDP_SEND_RATE = 0.02        # Frecuencia de envío: 50 Hz (20ms)
 
-# --- Mapeo de Ejes para Logitech F310 (modo DirectInput) ---
-# Eje 0: Stick Izquierdo Horizontal (X) - Giro
-# Eje 1: Stick Izquierdo Vertical (Y) - Adelante/Atrás
-AXIS_FORWARD = 1  # Eje Y del stick izquierdo
-AXIS_TURN = 0     # Eje X del stick izquierdo
+# --- Mapeo de Ejes para Logitech F310 - TANK DRIVE ---
+# MODO TANK DRIVE: Cada stick controla un motor independientemente
+AXIS_LEFT_MOTOR = 1   # Stick Izquierdo Vertical (Y) → Motor Izquierdo
+AXIS_RIGHT_MOTOR = 3  # Stick Derecho Vertical (Y) → Motor Derecho
 
 # --- Mapeo de Botones para Logitech F310 ---
 # Botón 0: A (verde)
 # Botón 1: B (rojo)
 BUTTON_DISCO_1 = 0  # Botón A
 BUTTON_DISCO_2 = 1  # Botón B
+
+# --- Estado de Toggle para Botones ---
+disco1_state = False  # Estado actual del disco 1 (False=OFF, True=ON)
+disco2_state = False  # Estado actual del disco 2 (False=OFF, True=ON)
+last_btn1_state = False  # Último estado del botón 1
+last_btn2_state = False  # Último estado del botón 2
 
 # =======================================================================
 # === FUNCIONES AUXILIARES ===
@@ -61,7 +67,7 @@ def map_joystick_to_range(raw_value, deadzone, max_output):
 # =======================================================================
 
 print("=" * 60)
-print("🎮 CONTROL REMOTO PARA ROBOT ESP32")
+print("🎮 CONTROL REMOTO PARA ROBOT ESP32 - TANK DRIVE MODE")
 print("=" * 60)
 
 # Inicializa pygame
@@ -86,10 +92,13 @@ print(f"\n📡 Configuración de red:")
 print(f"   - IP del ESP32: {ESP32_IP}")
 print(f"   - Puerto UDP: {ESP32_PORT}")
 print(f"   - Frecuencia de envío: {1/UDP_SEND_RATE:.0f} Hz")
-print(f"\n🕹️  Controles:")
-print(f"   - Stick Izquierdo: Movimiento (Adelante/Atrás/Giro)")
-print(f"   - Botón A (verde): Disco 1")
-print(f"   - Botón B (rojo): Disco 2")
+print(f"\n🕹️  Controles TANK DRIVE:")
+print(f"   - Stick Izquierdo (Y): Motor Izquierdo")
+print(f"   - Stick Derecho (Y): Motor Derecho")
+print(f"   - Botón A (verde): Toggle Disco 1 (ON/OFF)")
+print(f"   - Botón B (rojo): Toggle Disco 2 (ON/OFF)")
+print(f"\n💡 Tip: Mueve ambos sticks hacia adelante para avanzar recto")
+print(f"        Presiona A o B una vez para encender, otra vez para apagar")
 print(f"\n⚠️  Presiona Ctrl+C para detener")
 print("=" * 60)
 
@@ -107,61 +116,92 @@ except socket.error as e:
 # === BUCLE PRINCIPAL DE CONTROL ===
 # =======================================================================
 
-print("\n🚀 Iniciando control remoto...\n")
+print("\n🚀 Iniciando control remoto en modo TANK DRIVE...\n")
 
 try:
     while True:
         # Procesar eventos de pygame (necesario para actualizar el estado del joystick)
         pygame.event.pump()
         
-        # --- Lectura de Ejes (Para el control del vehículo) ---
+        # --- TANK DRIVE: Lectura de Ambos Sticks Verticales ---
         
-        # Leer Eje Y (Adelante/Atrás)
-        # NOTA: Invertimos el signo porque en la mayoría de joysticks,
-        # empujar hacia arriba da -1.0, pero queremos que sea positivo
+        # Leer Stick Izquierdo Y → Motor Izquierdo
+        # NOTA: Invertimos el signo porque empujar hacia arriba da -1.0
         try:
-            raw_y = -joystick.get_axis(AXIS_FORWARD)
+            raw_left = -joystick.get_axis(AXIS_LEFT_MOTOR)
         except (pygame.error, IndexError):
-            raw_y = 0.0
+            raw_left = 0.0
             
-        # Leer Eje X (Giro Izquierda/Derecha)
+        # Leer Stick Derecho Y → Motor Derecho
         try:
-            raw_x = joystick.get_axis(AXIS_TURN)
+            raw_right = -joystick.get_axis(AXIS_RIGHT_MOTOR)
         except (pygame.error, IndexError):
-            raw_x = 0.0
+            raw_right = 0.0
 
         # Aplicar deadzone y mapear a rango -100 a 100
-        joy_y = map_joystick_to_range(raw_y, JOYSTICK_DEADZONE, MAX_JOY_VALUE)
-        joy_x = map_joystick_to_range(raw_x, JOYSTICK_DEADZONE, MAX_JOY_VALUE)
+        motor_left = map_joystick_to_range(raw_left, JOYSTICK_DEADZONE, MAX_JOY_VALUE)
+        motor_right = map_joystick_to_range(raw_right, JOYSTICK_DEADZONE, MAX_JOY_VALUE)
 
-        # --- Lectura de Botones (Para los discos giratorios) ---
+        # --- Lectura de Botones con TOGGLE (ON/OFF) ---
+        # Detectar flanco de subida (botón recién presionado) y alternar estado
         
         try:
-            btn_disco_1 = joystick.get_button(BUTTON_DISCO_1)
+            current_btn1 = joystick.get_button(BUTTON_DISCO_1)
         except (pygame.error, IndexError):
-            btn_disco_1 = 0
+            current_btn1 = False
         
         try:
-            btn_disco_2 = joystick.get_button(BUTTON_DISCO_2)
+            current_btn2 = joystick.get_button(BUTTON_DISCO_2)
         except (pygame.error, IndexError):
-            btn_disco_2 = 0
+            current_btn2 = False
+
+        # Detectar flanco de subida (botón recién presionado) y alternar estado
+        if current_btn1 and not last_btn1_state:
+            disco1_state = not disco1_state  # Toggle
+        if current_btn2 and not last_btn2_state:
+            disco2_state = not disco2_state  # Toggle
+        
+        # Actualizar estados anteriores
+        last_btn1_state = current_btn1
+        last_btn2_state = current_btn2
+        
+        # Convertir booleano a entero para enviar
+        btn_disco_1 = 1 if disco1_state else 0
+        btn_disco_2 = 1 if disco2_state else 0
 
         # --- Crear el Paquete de Datos ---
-        # Formato: "Y:joyY,X:joyX,B1:btn1,B2:btn2"
-        data_packet = f"Y:{joy_y},X:{joy_x},B1:{btn_disco_1},B2:{btn_disco_2}"
+        # Formato TANK DRIVE: "L:motorLeft,R:motorRight,B1:btn1,B2:btn2"
+        data_packet = f"L:{motor_left},R:{motor_right},B1:{btn_disco_1},B2:{btn_disco_2}"
 
         # --- Enviar el Paquete UDP ---
         try:
             sock.sendto(data_packet.encode('utf-8'), (ESP32_IP, ESP32_PORT))
             
-            # Mostrar el paquete enviado (con indicadores visuales)
-            # Crear indicadores de dirección
-            forward_indicator = "↑" if joy_y > 10 else ("↓" if joy_y < -10 else "·")
-            turn_indicator = "→" if joy_x > 10 else ("←" if joy_x < -10 else "·")
-            disco1_indicator = "🟢" if btn_disco_1 else "⚫"
-            disco2_indicator = "🔴" if btn_disco_2 else "⚫"
+            # Mostrar el paquete enviado con indicadores visuales
+            # Crear indicadores de dirección para cada motor
+            left_indicator = "↑" if motor_left > 10 else ("↓" if motor_left < -10 else "·")
+            right_indicator = "↑" if motor_right > 10 else ("↓" if motor_right < -10 else "·")
+            disco1_indicator = "🟢 ON " if btn_disco_1 else "⚫ OFF"
+            disco2_indicator = "🔴 ON " if btn_disco_2 else "⚫ OFF"
             
-            print(f"📤 {forward_indicator}{turn_indicator} Y:{joy_y:4d} X:{joy_x:4d} | D1:{disco1_indicator} D2:{disco2_indicator}   ", end='\r')
+            # Determinar tipo de movimiento
+            if abs(motor_left - motor_right) < 10:
+                if motor_left > 10:
+                    movement = "⬆️ ADELANTE"
+                elif motor_left < -10:
+                    movement = "⬇️ ATRÁS"
+                else:
+                    movement = "⏸️ DETENIDO"
+            elif motor_left > 10 and motor_right < -10:
+                movement = "↪️ GIRO IZQ (en lugar)"
+            elif motor_left < -10 and motor_right > 10:
+                movement = "↩️ GIRO DER (en lugar)"
+            elif motor_left > motor_right:
+                movement = "↗️ GIRO DERECHA"
+            else:
+                movement = "↖️ GIRO IZQUIERDA"
+            
+            print(f"📤 {left_indicator} L:{motor_left:4d} | {right_indicator} R:{motor_right:4d} | {movement:22s} | D1:{disco1_indicator} D2:{disco2_indicator}   ", end='\r')
             
         except socket.error as e:
             print(f"\n⚠️  ERROR de red: {e}                    ")
@@ -175,7 +215,7 @@ except KeyboardInterrupt:
     
     # Enviar comando de parada antes de cerrar
     try:
-        stop_packet = "Y:0,X:0,B1:0,B2:0"
+        stop_packet = "L:0,R:0,B1:0,B2:0"
         sock.sendto(stop_packet.encode('utf-8'), (ESP32_IP, ESP32_PORT))
         print("✅ Comando de parada enviado al ESP32")
     except socket.error:
