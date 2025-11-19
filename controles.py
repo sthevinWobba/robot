@@ -8,7 +8,7 @@ import sys
 # =======================================================================
 
 # --- Configuración de Red UDP ---
-ESP32_IP = "192.168.0.11"  # IP estática del ESP32
+ESP32_IP = "192.168.0.111"  # IP estática del ESP32
 
 ESP32_PORT = 2390           # Debe coincidir con el puerto en el código del ESP32
 

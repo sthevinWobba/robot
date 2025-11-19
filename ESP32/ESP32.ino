@@ -30,6 +30,162 @@ constexpr float VOLTAGE_RATIO = MOTOR_VOLTAGE / BATTERY_VOLTAGE; // 6V/12V = 0.5
 
 // PWM máximo permitido para no exceder el voltaje del motor
 // Con 12V de batería y motores de 6V, limitamos al 50% del PWM
+constexpr int MAX_SAFE_PWM = (int)(MAX_DUTY_CYCLE * VOLTAGE_RATIO); // 1023 * 0.5 = 511
+
+// --- Configuración de Seguridad ---
+constexpr unsigned long TIMEOUT_MS = 500; // Timeout de seguridad (500ms sin comandos = detener)
+unsigned long lastCommandTime = 0;
+
+// --- Configuración de Red Wi-Fi y UDP ---
+const char* ssid = "DIOSGRACIAS";      // Reemplaza con el nombre de tu red
+const char* password = "123456789"; // Reemplaza con tu contraseña
+
+// Configuración de IP estática
+IPAddress local_IP(192, 168, 0, 111);    // IP estática deseada
+IPAddress gateway(192, 168, 0, 1);      // Gateway (router)
+IPAddress subnet(255, 255, 255, 0);     // Máscara de subred
+IPAddress primaryDNS(8, 8, 8, 8);       // DNS primario (Google DNS)
+IPAddress secondaryDNS(8, 8, 4, 4);     // DNS secundario (Google DNS)
+
+constexpr unsigned int LOCAL_PORT = 2390;    // Puerto para escuchar comandos
+char packetBuffer[255];                 // Buffer para los datos recibidos
+WiFiUDP Udp;
+
+// --- Variables de Estado - TANK DRIVE ---
+int motorLeft = 0;   // Valor del motor izquierdo (-100 a 100)
+int motorRight = 0;  // Valor del motor derecho (-100 a 100)
+int btnDisco1 = 0;   // Botón para Disco 1
+int btnDisco2 = 0;   // Botón para Disco 2
+
+
+// =======================================================================
+// === Funciones de Control del Vehículo ===
+// =======================================================================
+
+// Inicializa los canales PWM
+void setupPWM() {
+  // En ESP32 Core v3.0: ledcAttach(pin, freq, resolution);
+  ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
+}
+
+// Controla la velocidad y dirección de los motorreductores
+void setMotor(int pwmPin, int dirPin1, int dirPin2, int speed) {
+  // Asegura que el driver esté activo (STBY en HIGH)
+  digitalWrite(STBY, HIGH); 
+  
+  // Limita la velocidad al PWM seguro (protección de voltaje)
+  speed = constrain(speed, -MAX_SAFE_PWM, MAX_SAFE_PWM);
+  
+  // Si la velocidad es positiva, ir hacia adelante
+  if (speed > 0) {
+    digitalWrite(dirPin1, HIGH);
+    digitalWrite(dirPin2, LOW);
+    ledcWrite(pwmPin, speed);
+  } 
+  // Si la velocidad es negativa, ir hacia atrás
+  else if (speed < 0) {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, HIGH);
+    // Usamos el valor absoluto para PWM, ya que el signo indica la dirección
+    ledcWrite(pwmPin, abs(speed));
+  } 
+  // Si la velocidad es cero, detener el motor
+  else {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, LOW);
+    ledcWrite(pwmPin, 0);
+  }
+}
+
+// Detiene todos los motores (función de seguridad)
+void stopAllMotors() {
+  setMotor(PWMA, AIN1, AIN2, 0);
+  setMotor(PWMB, BIN1, BIN2, 0);
+  digitalWrite(STBY, LOW); // Poner driver en standby
+}
+
+// =======================================================================
+// === Funciones de Control de Discos Giratorios ===
+// =======================================================================
+
+void controlDiscos(int btn1, int btn2) {
+  // Controla el primer motor con el relé 1
+  // Asumimos un módulo de relé que se ACTIVA con HIGH (depende de tu módulo)
+  digitalWrite(RELAY_DISCO_1, btn1 == 1 ? HIGH : LOW);
+
+  // Controla el segundo motor con el relé 2
+  digitalWrite(RELAY_DISCO_2, btn2 == 1 ? HIGH : LOW);
+
+  // NOTA: Si tu módulo de relé se activa con LOW, invierte la lógica:
+  // digitalWrite(RELAY_DISCO_1, btn1 == 1 ? LOW : HIGH);
+}
+
+// =======================================================================
+// === Setup y Loop de Arduino ===
+// =======================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Configuración de Pines
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  
+  pinMode(RELAY_DISCO_1, OUTPUT);
+  pinMode(RELAY_DISCO_2, OUTPUT);
+  
+  // Inicializa motores apagados y relés en OFF
+  digitalWrite(STBY, LOW); 
+  digitalWrite(RELAY_DISCO_1, LOW);
+  digitalWrite(RELAY_DISCO_2, LOW);
+  
+  // 2. Configuración de PWM
+  setupPWM();
+
+  // 3. Conexión Wi-Fi con IP estática
+  Serial.println("\n=== CONFIGURACIÓN DE RED ===");
+  Serial.printf("IP estática solicitada: %s\n", local_IP.toString().c_str());
+  Serial.printf("Gateway: %s\n", gateway.toString().c_str());
+  
+  // Configurar IP estática ANTES de conectar
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("⚠️ Error al configurar IP estática");
+  }
+  
+  Serial.printf("\nConectando a %s ", ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" ¡Conectado!");
+    Serial.print("IP asignada: ");
+    Serial.println(WiFi.localIP());
+    
+    if (WiFi.localIP() == local_IP) {
+      Serial.println("✅ IP estática configurada correctamente");
+    } else {
+      Serial.println("⚠️ IP diferente a la solicitada (verifica configuración del router)");
+    }
+  } else {
+    Serial.println(" ❌ Error de conexión");
+    Serial.println("Verifica SSID y contraseña");
+  }
+
+  // 4. Iniciar Servidor UDP
+  Udp.begin(LOCAL_PORT);
+  Serial.print("Escuchando comandos UDP en el puerto: ");
+  Serial.println(LOCAL_PORT);
+  Serial.println("Modo: TANK DRIVE (control independiente de motores)");
   
   // 5. Mostrar información de protección de voltaje
   Serial.println("\n=== PROTECCIÓN DE VOLTAJE ===");
