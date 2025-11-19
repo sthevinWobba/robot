@@ -1,199 +1,211 @@
 #include <WiFi.h>
-#include <AsyncUDP.h>
-#include <Arduino.h> // Incluye funciones como constrain() y max()
+#include <WiFiUdp.h>
 
-// --- 1. CONFIGURACIÓN WIFI ---
-const char* ssid = "TU_NOMBRE_WIFI";       // Reemplaza con el nombre de tu red
-const char* password = "TU_CONTRASEÑA_WIFI"; // Reemplaza con tu contraseña
-const int PORT = 4200;                     // Puerto UDP de escucha
-AsyncUDP udp;
+// --- Definición de Pines GPIO para el TB6612FNG (Motor Driver) ---
+// Motor A (Derecho)
+const int AIN1 = 19; 
+const int AIN2 = 18;
+const int PWMA = 5;  // Pin para PWM (Velocidad)
+// Motor B (Izquierdo)
+const int BIN1 = 17;
+const int BIN2 = 16;
+const int PWMB = 4;  // Pin para PWM (Velocidad)
+// Pin STBY (Standby)
+const int STBY = 2; // Controla si el driver está activo
 
-// --- 2. CONFIGURACIÓN DEL SISTEMA DE SEGURIDAD Y TIMEOUT ---
-const int KILL_PIN = 23;      // Pin GPIO conectado al relé de seguridad
-unsigned long lastPacketTime = 0;
-const int TIMEOUT_MS = 500;   // 500ms sin recibir paquete = FAIL-SAFE
+// --- Definición de Pines GPIO para los Relés (Discos Giratorios) ---
+const int RELAY_DISCO_1 = 15; // Motor Lector CD 1
+const int RELAY_DISCO_2 = 13; // Motor Lector CD 2
 
-// --- 3. CONFIGURACIÓN DE PINES Y CANALES PWM DEL MOTOR (Unidireccional) ---
+// --- Configuración de PWM para el ESP32 ---
+constexpr int PWM_FREQ = 5000;      // Frecuencia del PWM (5 kHz)
+constexpr int PWM_RESOLUTION = 10;  // Resolución de 10 bits (0-1023)
+constexpr int MAX_DUTY_CYCLE = (1 << PWM_RESOLUTION) - 1; // 1023
 
-// Configuración general del PWM del ESP32
-const int freq = 5000;      // Frecuencia en Hz
-const int resolution = 8;   // Resolución de 8 bits (0-255)
+// --- Configuración de Seguridad ---
+constexpr unsigned long TIMEOUT_MS = 500; // Timeout de seguridad (500ms sin comandos = detener)
+unsigned long lastCommandTime = 0;
 
-// DRIVETRAIN - Motor Izquierdo (M1) - SOLO USA PIN PWM
-const int M1_PWM_CHANNEL = 0;
-const int M1_PIN_PWM = 2;   // GPIO para PWM
+// --- Configuración de Red Wi-Fi y UDP ---
+const char* ssid = "Tu_Red_WiFi";      // Reemplaza con el nombre de tu red
+const char* password = "Tu_Contrasena"; // Reemplaza con tu contraseña
+constexpr unsigned int LOCAL_PORT = 2390;    // Puerto para escuchar comandos
+char packetBuffer[255];                 // Buffer para los datos recibidos
+WiFiUDP Udp;
 
-// DRIVETRAIN - Motor Derecho (M2) - SOLO USA PIN PWM
-const int M2_PWM_CHANNEL = 1;
-const int M2_PIN_PWM = 17;  // GPIO para PWM
-
-// ARMA/ROTOR - Motor Arma (M3) - SOLO USA PIN PWM
-const int M3_PWM_CHANNEL = 2;
-const int M3_PIN_PWM = 21;  // GPIO para PWM
-// Nota: El pin M3_PIN_DIR (22) del código anterior ya no se usa, ya que la dirección es fija.
-
-
-// --- 4. ESTRUCTURA DE DATOS RECIBIDOS (5 bytes) ---
-struct ControlData {
-    int8_t lyAxis;    // Eje Y Izquierdo (-100 a 100)
-    int8_t lxAxis;    // Eje X Izquierdo (-100 a 100)
-    int8_t rTrigger;  // Gatillo Derecho (0 a 100)
-    uint8_t buttonB;  // Botón B (Kill Switch - 0 o 1)
-    uint8_t heartbeat; // Contador
-};
+// --- Variables de Estado ---
+int joyY = 0;   // Valor del eje Y del joystick (Adelante/Atrás)
+int joyX = 0;   // Valor del eje X del joystick (Giro)
+int btnDisco1 = 0; // Botón para Disco 1
+int btnDisco2 = 0; // Botón para Disco 2
 
 
-// --- DECLARACIONES DE FUNCIONES ---
-void activateKillSwitch(bool state);
-void stopAllMotors();
-// Firma simplificada: solo necesita el canal y el valor PWM
-void setMotorSpeed(int pwmChannel, int pwmValue); 
-void handleUdpPacket(AsyncUDPPacket packet);
+// =======================================================================
+// === Funciones de Control del Vehículo ===
+// =======================================================================
 
+// Inicializa los canales PWM
+void setupPWM() {
+  // En ESP32 Core v3.0: ledcAttach(pin, freq, resolution);
+  ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
+}
+
+// Controla la velocidad y dirección de los motorreductores
+void setMotor(int pwmPin, int dirPin1, int dirPin2, int speed) {
+  // Asegura que el driver esté activo (STBY en HIGH)
+  digitalWrite(STBY, HIGH); 
+  
+  // Limita la velocidad entre -1023 y 1023
+  speed = constrain(speed, -MAX_DUTY_CYCLE, MAX_DUTY_CYCLE);
+  
+  // Si la velocidad es positiva, ir hacia adelante
+  if (speed > 0) {
+    digitalWrite(dirPin1, HIGH);
+    digitalWrite(dirPin2, LOW);
+    ledcWrite(pwmPin, speed);
+  } 
+  // Si la velocidad es negativa, ir hacia atrás
+  else if (speed < 0) {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, HIGH);
+    // Usamos el valor absoluto para PWM, ya que el signo indica la dirección
+    ledcWrite(pwmPin, abs(speed));
+  } 
+  // Si la velocidad es cero, detener el motor
+  else {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, LOW);
+    ledcWrite(pwmPin, 0);
+  }
+}
+
+// Detiene todos los motores (función de seguridad)
+void stopAllMotors() {
+  setMotor(PWMA, AIN1, AIN2, 0);
+  setMotor(PWMB, BIN1, BIN2, 0);
+  digitalWrite(STBY, LOW); // Poner driver en standby
+}
+
+// =======================================================================
+// === Funciones de Control de Discos Giratorios ===
+// =======================================================================
+
+void controlDiscos(int btn1, int btn2) {
+  // Controla el primer motor con el relé 1
+  // Asumimos un módulo de relé que se ACTIVA con HIGH (depende de tu módulo)
+  digitalWrite(RELAY_DISCO_1, btn1 == 1 ? HIGH : LOW);
+
+  // Controla el segundo motor con el relé 2
+  digitalWrite(RELAY_DISCO_2, btn2 == 1 ? HIGH : LOW);
+
+  // NOTA: Si tu módulo de relé se activa con LOW, invierte la lógica:
+  // digitalWrite(RELAY_DISCO_1, btn1 == 1 ? LOW : HIGH);
+}
+
+// =======================================================================
+// === Setup y Loop de Arduino ===
+// =======================================================================
 
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    // 4.1 Configuración de PWM (LEDC)
-    ledcSetup(M1_PWM_CHANNEL, freq, resolution);
-    ledcSetup(M2_PWM_CHANNEL, freq, resolution);
-    ledcSetup(M3_PWM_CHANNEL, freq, resolution);
+  // 1. Configuración de Pines
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  
+  pinMode(RELAY_DISCO_1, OUTPUT);
+  pinMode(RELAY_DISCO_2, OUTPUT);
+  
+  // Inicializa motores apagados y relés en OFF
+  digitalWrite(STBY, LOW); 
+  digitalWrite(RELAY_DISCO_1, LOW);
+  digitalWrite(RELAY_DISCO_2, LOW);
+  
+  // 2. Configuración de PWM
+  setupPWM();
 
-    ledcAttachPin(M1_PIN_PWM, M1_PWM_CHANNEL);
-    ledcAttachPin(M2_PIN_PWM, M2_PWM_CHANNEL);
-    ledcAttachPin(M3_PIN_PWM, M3_PWM_CHANNEL);
+  // 3. Conexión Wi-Fi
+  Serial.printf("Conectando a %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" ¡Conectado!");
+  Serial.print("IP del ESP32: ");
+  Serial.println(WiFi.localIP());
 
-    // 4.2 Configuración de pines de Seguridad
-    pinMode(KILL_PIN, OUTPUT);
-
-    // Inicialmente, habilitar energía (Modo NORMAL) y detener motores
-    digitalWrite(KILL_PIN, HIGH);
-    stopAllMotors();
-
-    // 4.3 Inicialización Wi-Fi (Modo Cliente)
-    WiFi.begin(ssid, password);
-    Serial.print("Conectando a Wi-Fi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\n¡Conectado!");
-    Serial.print("IP del ESP32: ");
-    Serial.println(WiFi.localIP());
-
-    // 4.4 Inicialización UDP
-    if (udp.listen(PORT, handleUdpPacket)) {
-        Serial.print("Escuchando paquetes UDP en el puerto ");
-        Serial.println(PORT);
-    } else {
-        Serial.println("Error al iniciar UDP.");
-    }
+  // 4. Iniciar Servidor UDP
+  Udp.begin(LOCAL_PORT);
+  Serial.print("Escuchando comandos UDP en el puerto: ");
+  Serial.println(LOCAL_PORT);
+  
+  // Inicializar timestamp
+  lastCommandTime = millis();
 }
 
 void loop() {
-    // Monitoreo del Fail-Safe (Paso 1 del bucle principal)
-    if (millis() - lastPacketTime > TIMEOUT_MS) {
-        if (digitalRead(KILL_PIN) == HIGH) { // Sólo si ya está activo
-            Serial.println("¡Alerta! Pérdida de comunicación - FAIL-SAFE ACTIVADO");
-            activateKillSwitch(true); // Activar Kill Switch (corte de energía)
-        }
-    }
-}
-
-/**
- * @brief Función de Callback que se ejecuta al recibir un paquete UDP.
- */
-void handleUdpPacket(AsyncUDPPacket packet) {
-    lastPacketTime = millis();
-    activateKillSwitch(false); // Deshabilitar Kill Switch si estaba activo
-
-    if (packet.length() < sizeof(ControlData)) {
-        Serial.println("Paquete UDP incompleto o corrupto.");
-        return;
-    }
-
-    ControlData* data = (ControlData*)packet.data();
-
-    int LY_Axis = data->lyAxis;
-    int LX_Axis = data->lxAxis;
-    int R_Trigger = data->rTrigger;
-    int Button_B = data->buttonB;
-
-    // 2. Ejecutar Apagado de Emergencia Remoto
-    if (Button_B == 1) {
-        Serial.println("Apagado Remoto Activo (Gamepad)");
-        activateKillSwitch(true); // Activa Kill Switch y detiene motores
-        return;
-    }
-
-    // 3. Control de Movilidad (Giro Diferencial - Tank-Drive Mix)
+  // 1. Verificar si hay un paquete UDP disponible
+  int packetSize = Udp.parsePacket();
+  if (packetSize) {
+    // Leer el paquete
+    int len = Udp.read(packetBuffer, 255);
+    packetBuffer[len] = 0; // Terminar la cadena
     
-    // Paso 1: Usar solo la parte positiva de LY_Axis (solo avance).
-    int forwardSpeed = max(0, LY_Axis); // Rango de 0 a 100
+    // 2. Parsear el comando (Formato esperado: "Y:joyY,X:joyX,B1:btn1,B2:btn2")
+    if (sscanf(packetBuffer, "Y:%d,X:%d,B1:%d,B2:%d", &joyY, &joyX, &btnDisco1, &btnDisco2) == 4) {
+      
+      // Validar rangos recibidos
+      joyY = constrain(joyY, -100, 100);
+      joyX = constrain(joyX, -100, 100);
+      btnDisco1 = constrain(btnDisco1, 0, 1);
+      btnDisco2 = constrain(btnDisco2, 0, 1);
+      
+      // Actualizar timestamp de último comando válido
+      lastCommandTime = millis();
 
-    // Paso 2: Cálculo de la mezcla de velocidad:
-    int rawLeftSpeed = forwardSpeed + LX_Axis;
-    int rawRightSpeed = forwardSpeed - LX_Axis;
-
-    // Paso 3: Asegurar que la velocidad se mantenga en el rango de 0 a 100
-    int leftMotorSpeed = constrain(rawLeftSpeed, 0, 100);
-    int rightMotorSpeed = constrain(rawRightSpeed, 0, 100);
-    
-    // Paso 4: Convertir el rango (0 a 100) a (0 a 255) para el PWM
-    int leftPWM = map(leftMotorSpeed, 0, 100, 0, 255);
-    int rightPWM = map(rightMotorSpeed, 0, 100, 0, 255);
-
-    // Aplicar la velocidad a los motores de tracción
-    setMotorSpeed(M1_PWM_CHANNEL, leftPWM);
-    setMotorSpeed(M2_PWM_CHANNEL, rightPWM);
-
-    // 4. Control de Arma
-    // R_Trigger (0 a 100) se mapea a PWM (0-255).
-    int weaponPWM = map(R_Trigger, 0, 100, 0, 255);
-    ledcWrite(M3_PWM_CHANNEL, weaponPWM);
-}
-
-/**
- * @brief Implementa el corte físico de energía a través del relé.
- */
-void activateKillSwitch(bool state) {
-    if (state) {
-        // Corte de energía total (apaga el relé)
-        digitalWrite(KILL_PIN, LOW);
-        stopAllMotors(); // Redundancia
-    } else {
-        // Habilitar energía (enciende el relé)
-        digitalWrite(KILL_PIN, HIGH);
+      // --- Lógica de Control del Vehículo (Modelo Diferencial) ---
+      // Mapear los valores del joystick (-100 a 100) al rango PWM (-1023 a 1023)
+      int forwardSpeed = map(joyY, -100, 100, -MAX_DUTY_CYCLE, MAX_DUTY_CYCLE);
+      int turnAmount = map(joyX, -100, 100, -MAX_DUTY_CYCLE, MAX_DUTY_CYCLE); 
+      
+      // Velocidad de cada motor (usando un modelo de mezcla simple)
+      int speedLeft  = forwardSpeed + turnAmount;
+      int speedRight = forwardSpeed - turnAmount;
+      
+      // IMPORTANTE: Limitar velocidades combinadas para evitar saturación
+      speedLeft = constrain(speedLeft, -MAX_DUTY_CYCLE, MAX_DUTY_CYCLE);
+      speedRight = constrain(speedRight, -MAX_DUTY_CYCLE, MAX_DUTY_CYCLE);
+      
+      // Aplicar control a los motores
+      setMotor(PWMB, BIN1, BIN2, speedLeft);  // Motor B (Izquierdo)
+      setMotor(PWMA, AIN1, AIN2, speedRight); // Motor A (Derecho)
+      
+      // --- Lógica de Control de Discos Giratorios ---
+      controlDiscos(btnDisco1, btnDisco2);
+      
+      // Debug: Mostrar valores (opcional, comentar si no se necesita)
+      Serial.printf("Y:%d X:%d | L:%d R:%d | B1:%d B2:%d\n", 
+                    joyY, joyX, speedLeft, speedRight, btnDisco1, btnDisco2);
     }
+  } 
+  
+  // 3. TIMEOUT DE SEGURIDAD: Detener motores si no hay comandos recientes
+  if (millis() - lastCommandTime > TIMEOUT_MS) {
+    stopAllMotors();
+    // Solo imprimir una vez cuando se active el timeout
+    static bool timeoutWarningShown = false;
+    if (!timeoutWarningShown) {
+      Serial.println("⚠️ TIMEOUT: Sin comandos, motores detenidos por seguridad");
+      timeoutWarningShown = true;
+    }
+  } else {
+    // Resetear la advertencia cuando vuelvan los comandos
+    static bool timeoutWarningShown = false;
+    timeoutWarningShown = false;
+  }
 }
-
-/**
- * @brief Detiene instantáneamente todos los motores (PWM a 0).
- */
-void stopAllMotors() {
-    ledcWrite(M1_PWM_CHANNEL, 0);
-    ledcWrite(M2_PWM_CHANNEL, 0);
-    ledcWrite(M3_PWM_CHANNEL, 0);
-}
-
-/**
- * @brief Establece la velocidad de un motor DC unidireccional (solo PWM).
- * @param pwmChannel Canal PWM
- * @param pwmValue Valor PWM en el rango de 0 (Parado) a 255 (Máx).
- */
-void setMotorSpeed(int pwmChannel, int pwmValue) {
-    // Limitar el valor PWM a un rango válido (0 a 255)
-    pwmValue = constrain(pwmValue, 0, 255); 
-    
-    // Escribir el valor PWM al motor
-    ledcWrite(pwmChannel, pwmValue);
-}
-```eof
-
-Este código es la versión más simplificada y cumple con:
-
-* **Sin Puente H:** La función `setMotorSpeed` solo utiliza la salida PWM para controlar la velocidad.
-* **Unidireccional:** La lógica en `handleUdpPacket` fuerza que la velocidad sea siempre de **0 o positiva** (`forwardSpeed = max(0, LY_Axis)`), garantizando solo avance.
-* **Seguridad:** Mantiene el Fail-Safe por timeout y el Kill Switch físico.
-
-Ahora puedes cargar este código a tu ESP32 y usar el script de PC para controlarlo.
